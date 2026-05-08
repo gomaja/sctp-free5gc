@@ -20,6 +20,7 @@ import (
 	"io"
 	"math/rand"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -58,18 +59,49 @@ func TestStreams(t *testing.T) {
 	addr = ln.Addr().(*SCTPAddr)
 	t.Logf("Listen on %s", ln.Addr())
 
+	var closeOnce sync.Once
+	closeListener := func() {
+		closeOnce.Do(func() {
+			if err := ln.Close(); err != nil {
+				t.Logf("failed to close listener: %v", err)
+			}
+		})
+	}
+	t.Cleanup(closeListener)
+
+	var serverWG sync.WaitGroup
+	serverWG.Add(1)
 	go func() {
+		defer serverWG.Done()
 		for {
 			c, err := ln.Accept(1000)
-			sconn := c.(*SCTPConn)
 			if err != nil {
+				if ln.IsStopped() || err == syscall.EBADF {
+					return
+				}
 				t.Errorf("failed to accept: %v", err)
 				return
 			}
-			defer sconn.Close()
+			if c == nil {
+				if ln.IsStopped() {
+					return
+				}
+				continue
+			}
+			sconn, ok := c.(*SCTPConn)
+			if !ok || sconn == nil {
+				if ln.IsStopped() {
+					return
+				}
+				continue
+			}
 
-			sconn.SubscribeEvents(SCTP_EVENT_DATA_IO)
-			go func() {
+			serverWG.Add(1)
+			go func(sconn *SCTPConn) {
+				defer serverWG.Done()
+				defer sconn.Close()
+
+				sconn.SubscribeEvents(SCTP_EVENT_DATA_IO)
 				totalrcvd := 0
 				for {
 					buf := make([]byte, 512)
@@ -77,7 +109,7 @@ func TestStreams(t *testing.T) {
 					if err != nil {
 						if err == io.EOF || err == io.ErrUnexpectedEOF {
 							if n == 0 {
-								break
+								return
 							}
 							t.Logf(
 								"EOF on server connection. Total bytes received: %d, bytes received: %d",
@@ -89,6 +121,7 @@ func TestStreams(t *testing.T) {
 							return
 						}
 					}
+					totalrcvd += n
 					t.Logf("server read: info: %+v, payload: %s", info, string(buf[:n]))
 					n, err = sconn.SCTPWrite(buf[:n], info)
 					if err != nil {
@@ -96,15 +129,15 @@ func TestStreams(t *testing.T) {
 						return
 					}
 				}
-			}()
+			}(sconn)
 		}
 	}()
 
-	wait := make(chan struct{})
-	i := 0
-	for ; i < STREAM_TEST_CLIENTS; i++ {
+	var clientWG sync.WaitGroup
+	clientWG.Add(STREAM_TEST_CLIENTS)
+	for i := 0; i < STREAM_TEST_CLIENTS; i++ {
 		go func(test int) {
-			defer func() { wait <- struct{}{} }()
+			defer clientWG.Done()
 			conn, err := DialSCTPExt(
 				"sctp",
 				nil,
@@ -164,17 +197,33 @@ func TestStreams(t *testing.T) {
 				}
 				rtext := string(buf[:rn])
 				if rtext != text {
-					t.Fatalf("Mismatched payload: %s != %s", rtext, text)
+					t.Errorf("Mismatched payload: %s != %s", rtext, text)
+					return
 				}
 			}
 		}(i)
 	}
-	for ; i > 0; i-- {
-		select {
-		case <-wait:
-		case <-time.After(time.Second * 30):
-			close(wait)
-			t.Fatal("timed out")
-		}
+	clientDone := make(chan struct{})
+	go func() {
+		clientWG.Wait()
+		close(clientDone)
+	}()
+	select {
+	case <-clientDone:
+	case <-time.After(time.Second * 30):
+		closeListener()
+		t.Fatal("timed out waiting for clients")
+	}
+
+	closeListener()
+	serverDone := make(chan struct{})
+	go func() {
+		serverWG.Wait()
+		close(serverDone)
+	}()
+	select {
+	case <-serverDone:
+	case <-time.After(time.Second * 30):
+		t.Fatal("timed out waiting for server shutdown")
 	}
 }
